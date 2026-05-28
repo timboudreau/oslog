@@ -7,12 +7,62 @@ mod logger;
 pub use logger::OsLogger;
 
 use crate::sys::*;
-use std::ffi::{c_void, CString};
+use std::{ffi::{CString, c_void}, sync::{Mutex, atomic::AtomicUsize}};
 
+#[cfg(not(feature = "async"))]
 #[inline]
 fn to_cstr(message: &str) -> CString {
+    to_owned_cstr(message)
+}
+
+fn to_owned_cstr(message: &str) -> CString {
     let fixed = message.replace('\0', "(null)");
     CString::new(fixed).unwrap()
+}
+
+#[cfg(feature = "async")]
+#[inline]
+fn to_cstr(message: &str) -> &'static CString {
+    let mut guard = HOLDER.try_lock().unwrap();
+    guard.add(message.replace('\0', "(null)"))
+}
+
+#[cfg(feature = "async")]
+static HOLDER : Mutex<StringsHolder<50>> = Mutex::new(StringsHolder::new());
+
+/// A hideous hack to keep log messages allocated long enough for Apple's caulk async log
+/// (the default in audio unit system extensions) to (hopefully) finish with them before
+/// they are deallocated.
+///
+/// Simply keeps a ring buffer of `N` log messages and reaps the oldest when a new one is
+/// added.  Not for any sort of production use, but allows this crate to be used without
+/// causing constant access violations.
+#[cfg(feature = "async")]
+struct StringsHolder<const N: usize> {
+    cursor : AtomicUsize,
+    entries : [usize; N],
+}
+
+#[cfg(feature = "async")]
+impl<const N : usize> StringsHolder<N> {
+    const fn new() -> Self {
+        Self {
+            cursor: AtomicUsize::new(0),
+            entries: [0; N],
+        }
+    }
+
+    fn add(&mut self, msg : String) -> &'static CString {
+        let cs = CString::new(msg).unwrap();
+        let boxed: &'static mut CString = Box::leak(Box::new(cs));
+        let mut address = boxed.as_ptr() as usize;
+        let n = self.cursor.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        std::mem::swap(&mut address, &mut self.entries[n % N]);
+        if address != 0 {
+            unsafe { std::ptr::drop_in_place(address as *mut CString) };
+        }
+        boxed
+    }
 }
 
 #[repr(u8)]
@@ -37,6 +87,7 @@ impl From<log::Level> for Level {
     }
 }
 
+#[derive(Clone)]
 pub struct OsLog {
     inner: os_log_t,
     /// These need to remain allocated or system logging code can use
@@ -63,8 +114,8 @@ impl Drop for OsLog {
 impl OsLog {
     #[inline]
     pub fn new(subsystem: &str, category: &str) -> Self {
-        let subsystem = to_cstr(subsystem);
-        let category = to_cstr(category);
+        let subsystem = to_owned_cstr(subsystem);
+        let category = to_owned_cstr(category);
 
         let inner = unsafe { os_log_create(subsystem.as_ptr(), category.as_ptr()) };
 

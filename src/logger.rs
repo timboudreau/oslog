@@ -1,33 +1,62 @@
 use crate::OsLog;
-use dashmap::DashMap;
-use log::{LevelFilter, Log, Metadata, Record};
+use flurry::HashMap;
+use log::{Level, LevelFilter, Log, Metadata, Record};
 
 pub struct OsLogger {
-    loggers: DashMap<String, (Option<LevelFilter>, OsLog)>,
+    loggers: HashMap<String, (Option<LevelFilter>, OsLog)>,
     subsystem: String,
     default_level: LevelFilter,
 }
 
+impl OsLogger {
+    fn level_enabled(&self, logger_level : &Option<LevelFilter>, metadata_level : Level) -> bool {
+        if let Some(logger_level) = logger_level {
+            if let Some(level) = logger_level.to_level() {
+                return metadata_level <= level;
+            }
+        }
+        metadata_level <= self.default_level
+    }
+}
+
 impl Log for OsLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        let max_level = self
-            .loggers
-            .get(metadata.target())
-            .and_then(|pair| pair.0)
-            .unwrap_or(self.default_level);
-
-        metadata.level() <= max_level
+        let g = self.loggers.guard();
+        if let Some((entry, _)) = self.loggers.get(metadata.target(), &g) {
+            if let Some(level) = entry {
+                if let Some(level) = level.to_level() {
+                    return metadata.level() <= level;
+                }
+            }
+        }
+        metadata.level() <= self.default_level
     }
 
     fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            let pair = self
-                .loggers
-                .entry(record.target().into())
-                .or_insert((None, OsLog::new(&self.subsystem, record.target())));
-
-            let message = std::format!("{}", record.args());
-            pair.1.with_level(record.level().into(), &message);
+        let md = record.metadata();
+        // pending: would be more efficient to compare levels without doing two logger lookups
+        let g = self.loggers.guard();
+        let message = std::format!("{}", record.args());
+        if let Some((logger_level, logger)) = self.loggers.get(record.metadata().target(), &g) {
+            if self.level_enabled(logger_level, md.level()) {
+                logger.with_level(record.level().into(), &message);
+            }
+        } else {
+            let logger_name : String = record.metadata().target().into();
+            let new_logger = OsLog::new(&self.subsystem, record.target());
+            match self.loggers.try_insert(logger_name, (None, new_logger), &g) {
+                Ok((logger_level, logger)) => {
+                    if self.level_enabled(logger_level, md.level()) {
+                        logger.with_level(record.level().into(), &message);
+                    }
+                }
+                Err(e) => {
+                    let (logger_level, logger) = e.current;
+                    if self.level_enabled(logger_level, md.level()) {
+                        logger.with_level(record.level().into(), &message);
+                    }
+                }
+            }
         }
     }
 
@@ -39,7 +68,7 @@ impl OsLogger {
     /// By default the level filter will be set to `LevelFilter::Trace`.
     pub fn new(subsystem: &str) -> Self {
         Self {
-            loggers: DashMap::new(),
+            loggers: HashMap::new(),
             subsystem: subsystem.to_string(),
             default_level: LevelFilter::Trace,
         }
@@ -54,29 +83,33 @@ impl OsLogger {
 
     /// Sets or updates the category's level filter.
     pub fn category_level_filter(self, category: &str, level: LevelFilter) -> Self {
-        self.loggers
-            .entry(category.into())
-            .and_modify(|(existing_level, _)| *existing_level = Some(level))
-            .or_insert((Some(level), OsLog::new(&self.subsystem, category)));
-
-        self.update_global_max_level();
+        // Need a block here or the compiiler can't prove the guard is dropped
+        {
+            let guard = (&self.loggers).guard();
+            if let Some((_, logger)) = self.loggers.remove(category, &guard) {
+                self.loggers.insert(category.into(), (Some(level), logger.clone()), &guard);
+            } else {
+                let new_logger = OsLog::new(&self.subsystem, category);
+                self.loggers.insert(category.into(), (Some(level), new_logger), &guard);
+            }
+        }
         self
     }
 
     /// Updates the global max level based on the most permissive filter needed.
     fn update_global_max_level(&self) {
-        let mut most_permissive = self.default_level;
+        let mut most_permissive = &self.default_level;
 
+        let g = self.loggers.guard();
         // Check all category-specific filters to find the most permissive one
-        for entry in self.loggers.iter() {
-            if let Some(category_level) = entry.value().0 {
+        for (_, (filter, _)) in self.loggers.iter(&g) {
+            if let Some(category_level) = filter {
                 if category_level > most_permissive {
                     most_permissive = category_level;
                 }
             }
         }
-
-        log::set_max_level(most_permissive);
+        log::set_max_level(most_permissive.to_owned());
     }
 
     pub fn init(self) -> Result<(), log::SetLoggerError> {
